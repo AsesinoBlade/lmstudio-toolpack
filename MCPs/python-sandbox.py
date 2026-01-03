@@ -1,11 +1,10 @@
 from fastmcp import FastMCP
 from typing import Optional, Any, Dict, List, Union
-import multiprocessing as mp
 import io, contextlib, time, ast, os, signal, json
-
-# Added scientific stack imports
-import numpy as np
-import sympy as sp
+import sys
+import traceback
+import threading
+import queue
 
 mcp = FastMCP("Python SandBox")
 
@@ -15,12 +14,20 @@ SAFE_BUILTINS = {
     "zip": zip, "map": map, "filter": filter,
     "list": list, "dict": dict, "set": set, "tuple": tuple,
     "sorted": sorted, "any": any, "all": all, "print": print,
+    "round": round, "pow": pow, "divmod": divmod,
+    "str": str, "int": int, "float": float, "bool": bool,
+    "reversed": reversed, "slice": slice,
+    "__import__": __import__,
+    "__name__": "__main__",
 }
 
-MAX_STDIO = 64_000    # cap stdout/stderr
+MAX_STDIO = 64_000
 MAX_RESULT_BYTES = 128_000
 
 def worker_run(src: str, inp: Optional[Dict[str, Any]], q):
+    """Worker subprocess that executes code (with multiprocessing for isolation)."""
+    import multiprocessing as mp
+    
     start = time.time()
     stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
     try:
@@ -68,20 +75,16 @@ def worker_run(src: str, inp: Optional[Dict[str, Any]], q):
         })
 
 
-@mcp.tool
-def run_python(code: str, inputs: Optional[Dict[str, Any]] = None, timeout_seconds: float = 5.0) -> Dict[str, Any]:
-    """Execute a short Python snippet in a restricted subprocess.
-
-    - Safe builtins only, no imports.
-    - Captures stdout/stderr.
-    - If single expression, returns its value.
-    - Otherwise, assign to `result` in code.
-    """
+def run_in_subprocess(src: str, inp: Optional[Dict[str, Any]], timeout_seconds: float) -> Dict[str, Any]:
+    """Run code in isolated subprocess, wrapped in thread to avoid blocking stdio."""
+    import multiprocessing as mp
+    
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    p = ctx.Process(target=worker_run, args=(code, inputs, q))
+    p = ctx.Process(target=worker_run, args=(src, inp, q))
     p.start()
     p.join(timeout_seconds)
+    
     if p.is_alive():
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
@@ -97,11 +100,31 @@ def run_python(code: str, inputs: Optional[Dict[str, Any]] = None, timeout_secon
                 "timed_out": False, "duration": None}
 
 
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(mcp.run_stdio_async())
+@mcp.tool
+def run_python(code: str, inputs: Optional[Dict[str, Any]] = None, timeout_seconds: float = 30.0) -> Dict[str, Any]:
+    """Execute a short Python snippet in a restricted subprocess.
 
-# -------------------------- Added MCP Tools using NumPy / SymPy --------------------------
+    - Safe builtins only, can import numpy, sympy, math, etc.
+    - Captures stdout/stderr.
+    - If single expression, returns its value.
+    - Otherwise, assign to `result` in code.
+    - Runs in isolated subprocess for security.
+    """
+    # Run subprocess in background thread to avoid blocking MCP stdio
+    result_container = {}
+    
+    def thread_worker():
+        result_container['result'] = run_in_subprocess(code, inputs, timeout_seconds)
+    
+    t = threading.Thread(target=thread_worker, daemon=False)
+    t.start()
+    t.join(timeout_seconds + 1)  # Give extra second for thread cleanup
+    
+    return result_container.get('result', {
+        "stdout": "", "stderr": "", "result": None, 
+        "error": "Thread timeout", "timed_out": True, "duration": timeout_seconds
+    })
+
 
 @mcp.tool
 def numpy_stats(data: List[Union[int, float]]) -> Dict[str, float]:
@@ -116,6 +139,11 @@ def numpy_stats(data: List[Union[int, float]]) -> Dict[str, float]:
     -------
     dict with keys: count, mean, std, min, max, sum
     """
+    try:
+        import numpy as np
+    except ImportError:
+        return {"error": "NumPy not installed"}
+    
     if not data:
         return {"error": "empty input list"}
     arr = np.asarray(data, dtype=float)
@@ -142,6 +170,11 @@ def sympy_analyze(expr: str, solve_for: Optional[str] = None) -> Dict[str, Any]:
     sympy_analyze("(x**2 - 1)/(x-1)")
     sympy_analyze("x^2 - 4 = 0", solve_for="x")
     """
+    try:
+        import sympy as sp
+    except ImportError:
+        return {"error": "SymPy not installed"}
+    
     try:
         # Handle equation case if '=' present
         if '=' in expr:
@@ -179,14 +212,19 @@ def sympy_analyze(expr: str, solve_for: Optional[str] = None) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"ParseError: {type(e).__name__}: {e}", "input": expr}
 
+
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    from GlobalConfig import GlobalConfig
-    import asyncio
-    
-    if GlobalConfig.transport == "http":
-        asyncio.run(mcp.run_http_async(GlobalConfig.port) if GlobalConfig.port else mcp.run_http_async()) 
-    else:
-        asyncio.run(mcp.run_stdio_async())
+    try:
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from GlobalConfig import GlobalConfig
+        import asyncio
+        
+        if GlobalConfig.transport == "http":
+            asyncio.run(mcp.run_http_async(GlobalConfig.port) if GlobalConfig.port else mcp.run_http_async()) 
+        else:
+            asyncio.run(mcp.run_stdio_async())
+    except Exception as e:
+        print(f"FATAL ERROR: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
