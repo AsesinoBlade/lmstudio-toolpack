@@ -1,0 +1,3 @@
+cd lmstudio-toolpack/.venv/Scripts
+Activate
+then navigate to the lmstudio-toolpack/MCPs folder and python .py script
